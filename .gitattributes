@@ -1,0 +1,4 @@
+# Keep Windows line endings for scripts (batch files can misbehave with LF)
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+*.md   text
