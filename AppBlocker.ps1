@@ -32,6 +32,71 @@ $RULE_PREFIX = "AppBlocker:"
 
 # ── Helper Functions ───────────────────────────────────────────────────────────
 
+function Get-AppFriendlyName {
+    param(
+        [string]$ExePath,
+        [switch]$SkipCollisionCheck
+    )
+
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($ExePath)
+    $versionInfo = $null
+    try {
+        $versionInfo = (Get-Item -LiteralPath $ExePath -ErrorAction SilentlyContinue).VersionInfo
+    } catch {}
+
+    $desc = ""
+    if ($versionInfo) {
+        if (![string]::IsNullOrWhiteSpace($versionInfo.FileDescription)) {
+            $desc = $versionInfo.FileDescription.Trim()
+        } elseif (![string]::IsNullOrWhiteSpace($versionInfo.ProductName)) {
+            $desc = $versionInfo.ProductName.Trim()
+        }
+    }
+
+    # Use description if it's descriptive and distinct
+    $candidate = $baseName
+    if ($desc -and $desc -ne $baseName) {
+        $candidate = $desc
+    }
+
+    if ($SkipCollisionCheck) {
+        return $candidate
+    }
+
+    # Find a meaningful folder name up the hierarchy if needed
+    $dirItem = (Get-Item -LiteralPath $ExePath -ErrorAction SilentlyContinue).Directory
+    $meaningfulDir = ""
+    $curr = $dirItem
+    while ($curr -and $curr.Parent) {
+        if ($curr.Name -notmatch '^(Support Files|bin|x64|x86|Release|Debug|app)$') {
+            $meaningfulDir = $curr.Name
+            break
+        }
+        $curr = $curr.Parent
+    }
+
+    # Check collisions with existing blocked rules for OTHER paths
+    $otherRules = Get-BlockedApps | Where-Object {
+        $_.Path.TrimEnd('\') -ine $ExePath.TrimEnd('\')
+    }
+
+    if ($otherRules | Where-Object { $_.Name -ieq $candidate -or $_.DisplayName -ieq "$RULE_PREFIX $candidate" }) {
+        if ($meaningfulDir -and $candidate -notmatch [regex]::Escape($meaningfulDir)) {
+            $candidate = "$candidate ($meaningfulDir)"
+        } elseif ($versionInfo.ProductVersion -and $candidate -notmatch [regex]::Escape($versionInfo.ProductVersion)) {
+            $candidate = "$candidate ($($versionInfo.ProductVersion))"
+        } else {
+            $counter = 2
+            while ($otherRules | Where-Object { $_.Name -ieq "$candidate ($counter)" -or $_.DisplayName -ieq "$RULE_PREFIX $candidate ($counter)" }) {
+                $counter++
+            }
+            $candidate = "$candidate ($counter)"
+        }
+    }
+
+    return $candidate
+}
+
 function Get-BlockedApps {
     <# Returns a list of apps currently blocked by AppBlocker rules #>
     $rules = Get-NetFirewallRule -DisplayName "$RULE_PREFIX *" -ErrorAction SilentlyContinue |
@@ -41,11 +106,28 @@ function Get-BlockedApps {
     foreach ($rule in $rules) {
         $appFilter = $rule | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
         if ($appFilter -and $appFilter.Program -ne 'Any') {
+            $programPath = $appFilter.Program
+            $rawName = $rule.DisplayName -replace "^$([regex]::Escape($RULE_PREFIX))\s*", ""
+            
+            # Resolve a friendly name if the stored rule name was just an exe basename
+            $displayNameToShow = $rawName
+            if ($rawName -and (Test-Path -LiteralPath $programPath)) {
+                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($programPath)
+                if ($rawName -ieq $baseName) {
+                    $friendly = Get-AppFriendlyName -ExePath $programPath -SkipCollisionCheck
+                    if ($friendly -and $friendly -ne $baseName) {
+                        $displayNameToShow = $friendly
+                    }
+                }
+            }
+
             $blocked += [PSCustomObject]@{
-                Name     = $rule.DisplayName -replace "^$([regex]::Escape($RULE_PREFIX))\s*", ""
-                Path     = $appFilter.Program
-                Enabled  = $rule.Enabled
-                RuleName = $rule.DisplayName
+                Name        = $displayNameToShow
+                RawName     = $rawName
+                Path        = $programPath
+                Enabled     = $rule.Enabled
+                DisplayName = $rule.DisplayName
+                RuleName    = $rule.DisplayName
             }
         }
     }
@@ -55,14 +137,28 @@ function Get-BlockedApps {
 function Block-Application {
     param([string]$ExePath)
 
-    $appName = [System.IO.Path]::GetFileNameWithoutExtension($ExePath)
-    $displayName = "$RULE_PREFIX $appName"
-
-    # Check if already blocked
-    $existing = Get-NetFirewallRule -DisplayName "$displayName" -ErrorAction SilentlyContinue
-    if ($existing) {
-        return "Already blocked: $appName"
+    # Validate and resolve file
+    if (-not (Test-Path -LiteralPath $ExePath)) {
+        return "Error: File does not exist: $ExePath"
     }
+
+    $fileItem = Get-Item -LiteralPath $ExePath -ErrorAction SilentlyContinue
+    if (-not $fileItem -or $fileItem.PSIsContainer) {
+        return "Error: Path is not a file: $ExePath"
+    }
+    $ExePath = $fileItem.FullName
+
+    # Check if this exact file is already blocked
+    $currentBlocked = Get-BlockedApps
+    $alreadyBlocked = $currentBlocked | Where-Object {
+        $_.Path.TrimEnd('\') -ieq $ExePath.TrimEnd('\')
+    }
+    if ($alreadyBlocked) {
+        return "Already blocked: $($alreadyBlocked[0].Name)"
+    }
+
+    $appName = Get-AppFriendlyName -ExePath $ExePath
+    $displayName = "$RULE_PREFIX $appName"
 
     try {
         # Block outbound (app cannot send data to internet)
@@ -91,16 +187,32 @@ function Block-Application {
 }
 
 function Unblock-Application {
-    param([string]$AppName)
+    param(
+        [string]$DisplayName,
+        [string]$ExePath,
+        [string]$AppName
+    )
 
-    $displayName = "$RULE_PREFIX $AppName"
+    $label = if ($AppName) { $AppName } elseif ($DisplayName) { $DisplayName } else { "Application" }
     try {
-        Remove-NetFirewallRule -DisplayName "$displayName" -ErrorAction SilentlyContinue
-        Remove-NetFirewallRule -DisplayName "$displayName (Inbound)" -ErrorAction SilentlyContinue
-        return "Unblocked: $AppName"
+        if ($DisplayName) {
+            Remove-NetFirewallRule -DisplayName "$DisplayName" -ErrorAction SilentlyContinue
+            Remove-NetFirewallRule -DisplayName "$DisplayName (Inbound)" -ErrorAction SilentlyContinue
+        }
+        if ($ExePath) {
+            $matchingRules = Get-NetFirewallRule -DisplayName "$RULE_PREFIX *" -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $filter = $_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
+                    $filter.Program -and ($filter.Program.TrimEnd('\') -ieq $ExePath.TrimEnd('\'))
+                }
+            if ($matchingRules) {
+                $matchingRules | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+            }
+        }
+        return "Unblocked: $label"
     }
     catch {
-        return "Error unblocking $AppName : $_"
+        return "Error unblocking $label : $_"
     }
 }
 
@@ -149,6 +261,14 @@ $form.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
 $form.ForeColor = [System.Drawing.Color]::White
 $form.Font = New-Object System.Drawing.Font("Segoe UI", 9.5)
 
+# Load Icon if available
+$iconPath = Join-Path $PSScriptRoot "icon.ico"
+if (Test-Path -LiteralPath $iconPath) {
+    try {
+        $form.Icon = New-Object System.Drawing.Icon($iconPath)
+    } catch {}
+}
+
 # ── Title Label ────────────────────────────────────────────────────────────────
 $lblTitle = New-Object System.Windows.Forms.Label
 $lblTitle.Text = "🛡  AppBlocker"
@@ -174,7 +294,7 @@ $form.Controls.Add($separator)
 
 # ── Browse Section ─────────────────────────────────────────────────────────────
 $lblBrowse = New-Object System.Windows.Forms.Label
-$lblBrowse.Text = "Application to block:"
+$lblBrowse.Text = "Application to block (type/paste path or browse):"
 $lblBrowse.Location = New-Object System.Drawing.Point(20, 90)
 $lblBrowse.AutoSize = $true
 $form.Controls.Add($lblBrowse)
@@ -186,7 +306,9 @@ $txtPath.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
 $txtPath.ForeColor = [System.Drawing.Color]::White
 $txtPath.BorderStyle = "FixedSingle"
 $txtPath.Font = New-Object System.Drawing.Font("Segoe UI", 9.5)
-$txtPath.ReadOnly = $true
+$txtPath.ReadOnly = $false
+$txtPath.AutoCompleteMode = [System.Windows.Forms.AutoCompleteMode]::SuggestAppend
+$txtPath.AutoCompleteSource = [System.Windows.Forms.AutoCompleteSource]::FileSystem
 $form.Controls.Add($txtPath)
 
 $btnBrowse = New-Object System.Windows.Forms.Button
@@ -228,8 +350,8 @@ $listView.ForeColor = [System.Drawing.Color]::White
 $listView.BorderStyle = "FixedSingle"
 $listView.HeaderStyle = "Nonclickable"
 $listView.Font = New-Object System.Drawing.Font("Segoe UI", 9)
-$listView.Columns.Add("Application", 160) | Out-Null
-$listView.Columns.Add("Path", 390) | Out-Null
+$listView.Columns.Add("Application", 185) | Out-Null
+$listView.Columns.Add("Path", 365) | Out-Null
 $form.Controls.Add($listView)
 
 $btnUnblock = New-Object System.Windows.Forms.Button
@@ -327,7 +449,7 @@ function Refresh-List {
     foreach ($app in $blocked) {
         $item = New-Object System.Windows.Forms.ListViewItem($app.Name)
         $item.SubItems.Add($app.Path) | Out-Null
-        $item.Tag = $app.Name
+        $item.Tag = $app
         $listView.Items.Add($item) | Out-Null
     }
     $statusLabel.Text = "Showing $($blocked.Count) blocked app(s)"
@@ -336,40 +458,120 @@ function Refresh-List {
 
 # ── Event Handlers ─────────────────────────────────────────────────────────────
 
+# Allow pressing Enter inside text box to block immediately
+$txtPath.Add_KeyDown({
+    if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
+        $_.SuppressKeyPress = $true
+        $btnBlock.PerformClick()
+    }
+})
+
+# Drag and Drop support
+$form.AllowDrop = $true
+$txtPath.AllowDrop = $true
+$listView.AllowDrop = $true
+
+$dragEnterHandler = {
+    param($s, $e)
+    if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) {
+        $e.Effect = [System.Windows.Forms.DragDropEffects]::Copy
+    } else {
+        $e.Effect = [System.Windows.Forms.DragDropEffects]::None
+    }
+}
+
+$dragDropHandler = {
+    param($s, $e)
+    if ($e.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) {
+        $files = $e.Data.GetData([System.Windows.Forms.DataFormats]::FileDrop)
+        if ($files -and $files.Count -gt 0) {
+            $txtPath.Text = $files[0]
+            $txtPath.Focus()
+            $txtPath.SelectionStart = $txtPath.Text.Length
+        }
+    }
+}
+
+$form.Add_DragEnter($dragEnterHandler)
+$form.Add_DragDrop($dragDropHandler)
+$txtPath.Add_DragEnter($dragEnterHandler)
+$txtPath.Add_DragDrop($dragDropHandler)
+$listView.Add_DragEnter($dragEnterHandler)
+$listView.Add_DragDrop($dragDropHandler)
+
 $btnBrowse.Add_Click({
     $dialog = New-Object System.Windows.Forms.OpenFileDialog
     $dialog.Filter = "Applications (*.exe)|*.exe|All Files (*.*)|*.*"
     $dialog.Title = "Select an application to block"
-    $dialog.InitialDirectory = "C:\Program Files"
+    
+    # Pre-populate directory if path already in textbox
+    $initial = "C:\Program Files"
+    if (![string]::IsNullOrWhiteSpace($txtPath.Text)) {
+        $clean = $txtPath.Text.Trim().Trim('"', "'").Trim()
+        if (Test-Path -LiteralPath $clean) {
+            $item = Get-Item -LiteralPath $clean -ErrorAction SilentlyContinue
+            if ($item) {
+                if ($item.PSIsContainer) { $initial = $item.FullName }
+                else { $initial = $item.DirectoryName }
+            }
+        }
+    }
+    $dialog.InitialDirectory = $initial
+
     if ($dialog.ShowDialog() -eq "OK") {
         $txtPath.Text = $dialog.FileName
     }
 })
 
 $btnBlock.Add_Click({
-    if ([string]::IsNullOrWhiteSpace($txtPath.Text)) {
+    $rawInput = $txtPath.Text
+    if (-not [string]::IsNullOrWhiteSpace($rawInput)) {
+        # Strip outer quotes (e.g. from "Copy as path") and trim whitespace
+        $rawInput = $rawInput.Trim().Trim('"', "'").Trim()
+    }
+
+    if ([string]::IsNullOrWhiteSpace($rawInput)) {
         [System.Windows.Forms.MessageBox]::Show(
-            "Please browse for an application first.",
-            "No Application Selected",
+            "Please enter or browse for an application (.exe) path.",
+            "No Application Specified",
             "OK", "Warning"
         )
         return
     }
-    if (-not (Test-Path $txtPath.Text)) {
+
+    if (-not (Test-Path -LiteralPath $rawInput)) {
         [System.Windows.Forms.MessageBox]::Show(
-            "The selected file does not exist.",
+            "The specified file does not exist:`n$rawInput",
             "File Not Found",
             "OK", "Error"
         )
         return
     }
 
-    $exePath = $txtPath.Text
+    $targetItem = Get-Item -LiteralPath $rawInput -ErrorAction SilentlyContinue
+    if (-not $targetItem -or $targetItem.PSIsContainer) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "The specified path is a folder, not an executable file:`n$rawInput",
+            "Invalid Target",
+            "OK", "Error"
+        )
+        return
+    }
+
+    $exePath = $targetItem.FullName
     $result = Block-Application -ExePath $exePath
     $statusLabel.Text = $result
-    $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(120, 200, 120)
+
+    if ($result -like "Blocked:*") {
+        $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(120, 200, 120)
+        $txtPath.Text = ""
+    } elseif ($result -like "Already blocked:*") {
+        $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(255, 200, 100)
+    } else {
+        $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(255, 120, 120)
+    }
+
     Refresh-List
-    $txtPath.Text = ""
 
     # Rules do nothing while the firewall is off
     if ((Get-FirewallState).Count -gt 0) {
@@ -377,12 +579,12 @@ $btnBlock.Add_Click({
     }
 
     # Already-open connections survive until the app restarts
-    $appName = [System.IO.Path]::GetFileNameWithoutExtension($exePath)
+    $friendlyName = Get-AppFriendlyName -ExePath $exePath -SkipCollisionCheck
     $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exePath })
     if ($running.Count -gt 0) {
         $close = [System.Windows.Forms.MessageBox]::Show(
-            "'$appName' is currently running and may keep its existing connections until restarted.`n`n" +
-            "Close it now? (Unsaved work in $appName will be lost.)",
+            "'$friendlyName' is currently running and may keep its existing connections until restarted.`n`n" +
+            "Close it now? (Unsaved work in $friendlyName will be lost.)",
             "Close Running App", "YesNo", "Question"
         )
         if ($close -eq "Yes") {
@@ -402,14 +604,18 @@ $btnUnblock.Add_Click({
         return
     }
 
-    $appName = $listView.SelectedItems[0].Tag
+    $appObj = $listView.SelectedItems[0].Tag
+    $appName = if ($appObj -and $appObj.Name) { $appObj.Name } else { $listView.SelectedItems[0].Text }
+    $dispName = if ($appObj -and $appObj.DisplayName) { $appObj.DisplayName } else { "$RULE_PREFIX $appName" }
+    $exePath = if ($appObj -and $appObj.Path) { $appObj.Path } else { "" }
+
     $confirm = [System.Windows.Forms.MessageBox]::Show(
         "Unblock '$appName' and allow internet access?",
         "Confirm Unblock",
         "YesNo", "Question"
     )
     if ($confirm -eq "Yes") {
-        $result = Unblock-Application -AppName $appName
+        $result = Unblock-Application -DisplayName $dispName -ExePath $exePath -AppName $appName
         $statusLabel.Text = $result
         $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(120, 200, 120)
         Refresh-List

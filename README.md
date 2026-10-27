@@ -4,7 +4,9 @@ A simple Windows tool with a graphical interface that blocks selected applicatio
 
 ## Features
 
-- Browse for any `.exe` and block it with one click (inbound + outbound)
+- Type, paste, or browse for any `.exe` to block it with one click (inbound + outbound)
+- Drag and drop `.exe` files directly into the window
+- Distinguishes between different app versions sharing the same executable name (e.g. Adobe After Effects 2024 vs 2026)
 - See and unblock currently blocked apps
 - Shows Windows Firewall status and can turn it on (blocks only work while the firewall is on)
 - Offers to close a running app after blocking it, so existing connections are dropped
@@ -19,9 +21,9 @@ A simple Windows tool with a graphical interface that blocks selected applicatio
 ## Usage
 
 1. Download or clone this repository.
-2. Double-click **`AppBlocker.bat`** and accept the UAC prompt.
+2. Double-click **`AppBlocker.bat`** (or `AppBlocker.exe`) and accept the UAC prompt.
 3. If prompted, turn on Windows Firewall.
-4. Click **Browse...**, pick the app's `.exe`, then click **Block This App**.
+4. Type/paste the path, drag and drop, or click **Browse...** to pick the app's `.exe`, then click **Block This App**.
 5. To restore access, select the app in the list and click **Unblock Selected**.
 
 ## Notes
